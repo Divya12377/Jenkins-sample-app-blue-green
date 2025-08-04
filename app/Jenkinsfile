@@ -4,6 +4,7 @@ pipeline {
     environment {
         DOCKER_HUB_REPO = 'raheman456/sample-node-app'
         KUBE_NAMESPACE = 'jenkins'
+        DOCKER_HUB_CREDENTIALS = credentials('docker-hub-credentials')
     }
     
     stages {
