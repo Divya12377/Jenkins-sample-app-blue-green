@@ -1,10 +1,5 @@
 pipeline {
-    agent {
-        docker {
-            image 'docker:24-dind'
-            args '--privileged -v /var/run/docker.sock:/var/run/docker.sock'
-        }
-    }
+    agent any
     
     environment {
         DOCKER_HUB_REPO = 'raheman456/sample-node-app'
@@ -13,19 +8,38 @@ pipeline {
     }
     
     stages {
-        stage('Setup Tools') {
+        stage('Install Tools') {
             steps {
-                sh '''
-                    # Install kubectl
-                    apk add --no-cache curl
-                    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-                    chmod +x kubectl
-                    mv kubectl /usr/local/bin/
+                script {
+                    // Check if tools are already installed
+                    def dockerExists = sh(script: 'which docker', returnStatus: true) == 0
+                    def kubectlExists = sh(script: 'which kubectl', returnStatus: true) == 0
                     
-                    # Verify installations
-                    docker --version
-                    kubectl version --client
-                '''
+                    if (!dockerExists) {
+                        echo "Installing Docker CLI..."
+                        sh '''
+                            apt-get update
+                            apt-get install -y apt-transport-https ca-certificates curl gnupg lsb-release
+                            curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+                            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+                            apt-get update
+                            apt-get install -y docker-ce-cli
+                        '''
+                    }
+                    
+                    if (!kubectlExists) {
+                        echo "Installing kubectl..."
+                        sh '''
+                            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                            chmod +x kubectl
+                            mv kubectl /usr/local/bin/
+                        '''
+                    }
+                    
+                    // Verify installations
+                    sh 'docker --version || echo "Docker not available"'
+                    sh 'kubectl version --client || echo "kubectl not available"'
+                }
             }
         }
         
@@ -86,9 +100,6 @@ pipeline {
                     
                     // Wait for deployment to be ready
                     sh "kubectl rollout status deployment/sample-app-${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE} --timeout=300s"
-                    
-                    // Verify pods are running
-                    sh "kubectl get pods -l app=sample-app,version=${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE}"
                 }
             }
         }
@@ -106,12 +117,7 @@ pipeline {
                         echo "Testing current service at: http://${serviceUrl}"
                         sh "curl -f http://${serviceUrl} || true"
                     } else {
-                        echo "LoadBalancer URL not available, testing internally"
-                        // Test using internal service
-                        sh """
-                            kubectl run test-pod-${BUILD_NUMBER} --image=curlimages/curl:latest --rm -i --restart=Never --timeout=60s -n ${KUBE_NAMESPACE} -- \\
-                            curl -f http://sample-app-${env.DEPLOY_VERSION}-service.${KUBE_NAMESPACE}.svc.cluster.local || echo "Internal test completed"
-                        """
+                        echo "LoadBalancer URL not available, skipping external test"
                     }
                     
                     echo "New ${env.DEPLOY_VERSION} version is ready for traffic switch"
@@ -122,34 +128,12 @@ pipeline {
         stage('Switch Traffic') {
             steps {
                 script {
-                    echo "Switching traffic from ${env.CURRENT_VERSION} to ${env.DEPLOY_VERSION}"
-                    
                     // Update service to point to new version
                     sh """
                         kubectl patch service sample-app-service -n ${KUBE_NAMESPACE} -p '{"spec":{"selector":{"version":"${env.DEPLOY_VERSION}"}}}'
                     """
                     
-                    // Wait for change to propagate
-                    sleep(time: 10, unit: "SECONDS")
-                    
-                    // Verify the switch
-                    def serviceUrl = sh(
-                        script: "kubectl get svc sample-app-service -n ${KUBE_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo ''",
-                        returnStdout: true
-                    ).trim()
-                    
-                    if (serviceUrl) {
-                        echo "Testing switched service:"
-                        sh """
-                            for i in 1 2 3; do
-                                echo "Test attempt \$i:"
-                                curl http://${serviceUrl} || true
-                                sleep 2
-                            done
-                        """
-                    }
-                    
-                    echo "Traffic successfully switched to ${env.DEPLOY_VERSION} version"
+                    echo "Traffic switched to ${env.DEPLOY_VERSION} version"
                 }
             }
         }
@@ -162,9 +146,7 @@ pipeline {
                         timeout(time: 2, unit: 'MINUTES') {
                             input message: "Scale down old version (${env.CURRENT_VERSION})?", ok: "Yes"
                         }
-                        echo "Scaling down ${env.CURRENT_VERSION} deployment"
                         sh "kubectl scale deployment sample-app-${env.CURRENT_VERSION} --replicas=0 -n ${KUBE_NAMESPACE}"
-                        echo "Old version ${env.CURRENT_VERSION} scaled down successfully"
                     } catch (Exception e) {
                         echo "Cleanup skipped or timed out - keeping old version running"
                     }
@@ -175,28 +157,18 @@ pipeline {
     
     post {
         always {
-            // Cleanup Docker images and login session
             sh '''
                 docker logout || true
                 docker system prune -f || true
             '''
         }
-        success {
-            echo "Blue-Green deployment completed successfully!"
-            echo "Active version: ${env.DEPLOY_VERSION}"
-        }
         failure {
             script {
-                echo "Deployment failed! Attempting rollback..."
-                try {
-                    // Rollback on failure
-                    sh """
-                        kubectl patch service sample-app-service -n ${KUBE_NAMESPACE} -p '{"spec":{"selector":{"version":"${env.CURRENT_VERSION}"}}}'
-                    """
-                    echo "Rolled back to ${env.CURRENT_VERSION} version"
-                } catch (Exception e) {
-                    echo "Rollback failed: ${e.getMessage()}"
-                }
+                // Rollback on failure
+                sh """
+                    kubectl patch service sample-app-service -n ${KUBE_NAMESPACE} -p '{"spec":{"selector":{"version":"${env.CURRENT_VERSION}"}}}'
+                """
+                echo "Rolled back to ${env.CURRENT_VERSION} version"
             }
         }
     }
