@@ -15,25 +15,60 @@ spec:
     spec:
       serviceAccountName: jenkins
       securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
+        runAsUser: 0  # Changed to root to access Docker socket
+        runAsGroup: 0
+        fsGroup: 0
+      initContainers:
+      - name: install-tools
+        image: alpine:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Installing Docker CLI and kubectl..."
+          
+          # Install curl
+          apk add --no-cache curl
+          
+          # Install Docker CLI
+          DOCKER_VERSION="24.0.7"
+          curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" | tar -xz -C /tmp
+          cp /tmp/docker/docker /shared-tools/
+          
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          cp kubectl /shared-tools/
+          
+          # Set permissions
+          chmod +x /shared-tools/*
+          
+          echo "Tools installed successfully"
+        volumeMounts:
+        - name: shared-tools
+          mountPath: /shared-tools
       containers:
       - name: jenkins
-        image: jenkins/jenkins:2.462.3-lts  # Latest LTS version
+        image: jenkins/jenkins:2.462.3-lts
         ports:
         - containerPort: 8080
           name: http
         - containerPort: 50000
           name: jnlp
-        volumeMounts:
-        - name: jenkins-home
-          mountPath: /var/jenkins_home
         env:
         - name: JENKINS_OPTS
           value: "--httpPort=8080"
         - name: JAVA_OPTS
-          value: "-Xmx1g"
+          value: "-Xmx1g -Djenkins.install.runSetupWizard=false"
+        - name: PATH
+          value: "/shared-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        volumeMounts:
+        - name: jenkins-home
+          mountPath: /var/jenkins_home
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+        - name: shared-tools
+          mountPath: /shared-tools
         resources:
           requests:
             memory: "1Gi"
@@ -61,3 +96,8 @@ spec:
       - name: jenkins-home
         persistentVolumeClaim:
           claimName: jenkins-pvc
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+      - name: shared-tools
+        emptyDir: {}
