@@ -1,5 +1,5 @@
 pipeline {
-    agent any  // Removed docker label requirement
+    agent any
     
     environment {
         DOCKER_HUB_REPO = 'raheman456/sample-node-app'
@@ -11,15 +11,14 @@ pipeline {
         stage('Verify Environment') {
             steps {
                 script {
-                    // Check for Docker with better error handling
+                    // Check for Docker
                     env.DOCKER_AVAILABLE = sh(
                         script: 'command -v docker',
                         returnStatus: true
                     ) == 0
                     
                     if (!env.DOCKER_AVAILABLE.toBoolean()) {
-                        echo "⚠️ Warning: Docker not found on this agent"
-                        echo "The build will continue but image-related steps will be skipped"
+                        error("Docker not found on this agent. Please use an agent with Docker installed.")
                     }
                     
                     // Install kubectl if not available
@@ -34,8 +33,8 @@ pipeline {
                     }
                     
                     sh '''
-                        echo "Environment status:"
-                        echo "Docker available: ${DOCKER_AVAILABLE}"
+                        echo "Environment verification:"
+                        docker --version
                         kubectl version --client
                     '''
                 }
@@ -58,22 +57,22 @@ pipeline {
                     
                     if (currentVersion == 'blue') {
                         env.DEPLOY_VERSION = 'green'
+                        env.DEPLOY_FILE = 'app-green.yaml'
                         env.CURRENT_VERSION = 'blue'
                     } else {
                         env.DEPLOY_VERSION = 'blue'
+                        env.DEPLOY_FILE = 'app-blue.yaml'
                         env.CURRENT_VERSION = currentVersion == 'green' ? 'green' : 'none'
                     }
                     
                     echo "Current version: ${env.CURRENT_VERSION}"
                     echo "Deploying version: ${env.DEPLOY_VERSION}"
+                    echo "Using deployment file: ${env.DEPLOY_FILE}"
                 }
             }
         }
         
         stage('Build and Push Image') {
-            when {
-                expression { env.DOCKER_AVAILABLE.toBoolean() }
-            }
             steps {
                 script {
                     withCredentials([usernamePassword(
@@ -86,7 +85,7 @@ pipeline {
                             echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
                             
                             echo "Building Docker image..."
-                            docker build -t $DOCKER_HUB_REPO:$DEPLOY_VERSION .
+                            docker build -t $DOCKER_HUB_REPO:$DEPLOY_VERSION ./app
                             
                             echo "Pushing image to registry..."
                             docker push $DOCKER_HUB_REPO:$DEPLOY_VERSION
@@ -101,12 +100,11 @@ pipeline {
         stage('Deploy New Version') {
             steps {
                 script {
-                    // This assumes you have pre-built images in your registry
-                    // or are using some other deployment method
                     sh """
-                        echo "Deploying $DEPLOY_VERSION version..."
-                        sed "s|{{IMAGE}}|$DOCKER_HUB_REPO:$DEPLOY_VERSION|g" app-deployment.yaml > temp-deploy.yaml
+                        echo "Deploying $DEPLOY_VERSION version using $DEPLOY_FILE..."
+                        sed "s|{{IMAGE}}|$DOCKER_HUB_REPO:$DEPLOY_VERSION|g" ./app/$DEPLOY_FILE > temp-deploy.yaml
                         kubectl apply -f temp-deploy.yaml -n $KUBE_NAMESPACE
+                        kubectl apply -f ./app/app-service.yaml -n $KUBE_NAMESPACE
                         rm temp-deploy.yaml
                         
                         echo "Waiting for deployment to be ready..."
@@ -116,7 +114,6 @@ pipeline {
             }
         }
         
-        // Remaining stages remain the same as previous example...
         stage('Verify Deployment') {
             steps {
                 script {
@@ -178,7 +175,7 @@ pipeline {
             '''
         }
         success {
-            echo "✅ Deployment completed successfully"
+            echo "✅ Successfully deployed $DEPLOY_VERSION version"
         }
         failure {
             script {
