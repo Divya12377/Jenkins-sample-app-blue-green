@@ -1,15 +1,11 @@
 pipeline {
-    agent {
-        docker {
-            image 'docker:24-dind'
-            args '--privileged -v /var/run/docker.sock:/var/run/docker.sock'
-        }
-    }
+    agent any
     
     environment {
         DOCKER_HUB_REPO = 'raheman456/sample-node-app'
         KUBE_NAMESPACE = 'jenkins'
         DOCKER_CREDENTIALS = credentials('docker-hub-credentials')
+        PATH = "${PATH}:/usr/local/bin"
     }
     
     stages {
@@ -19,15 +15,21 @@ pipeline {
             }
         }
         
-        stage('Install kubectl') {
+        stage('Install Tools') {
             steps {
                 sh '''
-                    echo "Installing kubectl..."
-                    apk add --no-cache curl
-                    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-                    chmod +x kubectl
-                    mv kubectl /usr/local/bin/
-                    kubectl version --client
+                    echo "Installing required tools..."
+                    
+                    # Install kubectl if not present
+                    if ! command -v kubectl &> /dev/null; then
+                        echo "Installing kubectl..."
+                        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                        chmod +x kubectl
+                        sudo mv kubectl /usr/local/bin/ 2>/dev/null || mv kubectl ./kubectl
+                        export PATH="./:\$PATH"
+                    fi
+                    
+                    echo "Tools installation completed"
                 '''
             }
         }
@@ -35,9 +37,9 @@ pipeline {
         stage('Verify Tools') {
             steps {
                 sh '''
-                    echo "Verifying installed tools..."
-                    docker --version
-                    kubectl version --client
+                    echo "Verifying available tools..."
+                    docker --version || echo "Docker not found - please install Docker on Jenkins agent"
+                    ./kubectl version --client 2>/dev/null || kubectl version --client || echo "kubectl not found"
                     echo "Tools verification completed"
                 '''
             }
@@ -48,7 +50,7 @@ pipeline {
                 script {
                     // Check which version is currently active
                     def currentVersion = sh(
-                        script: "kubectl get service sample-app-service -n ${KUBE_NAMESPACE} -o jsonpath='{.spec.selector.version}' 2>/dev/null || echo 'none'",
+                        script: "./kubectl get service sample-app-service -n ${KUBE_NAMESPACE} -o jsonpath='{.spec.selector.version}' 2>/dev/null || kubectl get service sample-app-service -n ${KUBE_NAMESPACE} -o jsonpath='{.spec.selector.version}' 2>/dev/null || echo 'none'",
                         returnStdout: true
                     ).trim()
                     
@@ -102,16 +104,16 @@ pipeline {
                         sed -i 's|image: .*|image: ${DOCKER_HUB_REPO}:${env.DEPLOY_VERSION}|g' temp-deployment.yaml
                         
                         echo "Applying deployment..."
-                        kubectl apply -f temp-deployment.yaml -n ${KUBE_NAMESPACE}
+                        ./kubectl apply -f temp-deployment.yaml -n ${KUBE_NAMESPACE} 2>/dev/null || kubectl apply -f temp-deployment.yaml -n ${KUBE_NAMESPACE}
                         
                         # Clean up temp file
                         rm temp-deployment.yaml
                         
                         echo "Waiting for deployment to be ready..."
-                        kubectl rollout status deployment/sample-app-${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE} --timeout=300s
+                        ./kubectl rollout status deployment/sample-app-${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE} --timeout=300s 2>/dev/null || kubectl rollout status deployment/sample-app-${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE} --timeout=300s
                         
                         echo "Verifying pods..."
-                        kubectl get pods -l app=sample-app,version=${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE}
+                        ./kubectl get pods -l app=sample-app,version=${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE} 2>/dev/null || kubectl get pods -l app=sample-app,version=${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE}
                     """
                 }
             }
@@ -124,11 +126,11 @@ pipeline {
                         echo "Running health check on new deployment..."
                         
                         # Get pod name for health check
-                        POD_NAME=\$(kubectl get pods -l app=sample-app,version=${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE} -o jsonpath='{.items[0].metadata.name}')
+                        POD_NAME=\$(./kubectl get pods -l app=sample-app,version=${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || kubectl get pods -l app=sample-app,version=${env.DEPLOY_VERSION} -n ${KUBE_NAMESPACE} -o jsonpath='{.items[0].metadata.name}')
                         
                         if [ ! -z "\$POD_NAME" ]; then
                             echo "Health checking pod: \$POD_NAME"
-                            kubectl exec \$POD_NAME -n ${KUBE_NAMESPACE} -- curl -f http://localhost:3000 || echo "Health check completed"
+                            ./kubectl exec \$POD_NAME -n ${KUBE_NAMESPACE} -- curl -f http://localhost:3000 2>/dev/null || kubectl exec \$POD_NAME -n ${KUBE_NAMESPACE} -- curl -f http://localhost:3000 || echo "Health check completed"
                         else
                             echo "No pods found for health check"
                         fi
@@ -146,7 +148,7 @@ pipeline {
                     
                     // Update service to point to new version
                     sh """
-                        kubectl patch service sample-app-service -n ${KUBE_NAMESPACE} -p '{"spec":{"selector":{"version":"${env.DEPLOY_VERSION}"}}}'
+                        ./kubectl patch service sample-app-service -n ${KUBE_NAMESPACE} -p '{"spec":{"selector":{"version":"${env.DEPLOY_VERSION}"}}}' 2>/dev/null || kubectl patch service sample-app-service -n ${KUBE_NAMESPACE} -p '{"spec":{"selector":{"version":"${env.DEPLOY_VERSION}"}}}'
                         
                         echo "Traffic switched to ${env.DEPLOY_VERSION} version"
                         
@@ -154,7 +156,7 @@ pipeline {
                         sleep 5
                         
                         # Verify service endpoints
-                        kubectl get endpoints sample-app-service -n ${KUBE_NAMESPACE}
+                        ./kubectl get endpoints sample-app-service -n ${KUBE_NAMESPACE} 2>/dev/null || kubectl get endpoints sample-app-service -n ${KUBE_NAMESPACE}
                     """
                 }
             }
@@ -167,10 +169,10 @@ pipeline {
                         echo "Verifying deployment..."
                         
                         # Check service details
-                        kubectl describe service sample-app-service -n ${KUBE_NAMESPACE}
+                        ./kubectl describe service sample-app-service -n ${KUBE_NAMESPACE} 2>/dev/null || kubectl describe service sample-app-service -n ${KUBE_NAMESPACE}
                         
                         # Get LoadBalancer URL if available
-                        LB_URL=\$(kubectl get svc sample-app-service -n ${KUBE_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')
+                        LB_URL=\$(./kubectl get svc sample-app-service -n ${KUBE_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || kubectl get svc sample-app-service -n ${KUBE_NAMESPACE} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')
                         
                         if [ ! -z "\$LB_URL" ]; then
                             echo "LoadBalancer URL: http://\$LB_URL"
@@ -200,7 +202,7 @@ pipeline {
                         
                         echo "Scaling down ${env.CURRENT_VERSION} deployment..."
                         sh """
-                            kubectl scale deployment sample-app-${env.CURRENT_VERSION} --replicas=0 -n ${KUBE_NAMESPACE}
+                            ./kubectl scale deployment sample-app-${env.CURRENT_VERSION} --replicas=0 -n ${KUBE_NAMESPACE} 2>/dev/null || kubectl scale deployment sample-app-${env.CURRENT_VERSION} --replicas=0 -n ${KUBE_NAMESPACE}
                             echo "Old version ${env.CURRENT_VERSION} scaled down successfully"
                         """
                     } catch (Exception e) {
@@ -233,7 +235,7 @@ pipeline {
                 try {
                     sh """
                         echo "Rolling back to ${env.CURRENT_VERSION}..."
-                        kubectl patch service sample-app-service -n ${KUBE_NAMESPACE} -p '{"spec":{"selector":{"version":"${env.CURRENT_VERSION}"}}}'
+                        ./kubectl patch service sample-app-service -n ${KUBE_NAMESPACE} -p '{"spec":{"selector":{"version":"${env.CURRENT_VERSION}"}}}' 2>/dev/null || kubectl patch service sample-app-service -n ${KUBE_NAMESPACE} -p '{"spec":{"selector":{"version":"${env.CURRENT_VERSION}"}}}'
                         echo "✅ Rollback completed - service pointing back to ${env.CURRENT_VERSION}"
                     """
                 } catch (Exception e) {
