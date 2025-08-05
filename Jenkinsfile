@@ -1,48 +1,41 @@
 pipeline {
-    agent {
-        label 'docker' // Ensure your agent has Docker installed
-    }
+    agent any  // Removed docker label requirement
     
     environment {
         DOCKER_HUB_REPO = 'raheman456/sample-node-app'
         KUBE_NAMESPACE = 'jenkins'
-        PATH = "$PATH:/usr/local/bin"
+        PATH = "$PATH:/usr/local/bin:$WORKSPACE/bin"
     }
     
     stages {
         stage('Verify Environment') {
             steps {
                 script {
-                    // Verify Docker is available
-                    def dockerAvailable = sh(
+                    // Check for Docker with better error handling
+                    env.DOCKER_AVAILABLE = sh(
                         script: 'command -v docker',
                         returnStatus: true
                     ) == 0
                     
-                    if (!dockerAvailable) {
-                        error("Docker not found on this agent. Please use an agent with Docker installed.")
+                    if (!env.DOCKER_AVAILABLE.toBoolean()) {
+                        echo "⚠️ Warning: Docker not found on this agent"
+                        echo "The build will continue but image-related steps will be skipped"
                     }
                     
                     // Install kubectl if not available
-                    def kubectlAvailable = sh(
-                        script: 'command -v kubectl',
-                        returnStatus: true
-                    ) == 0
-                    
-                    if (!kubectlAvailable) {
+                    if (sh(script: 'command -v kubectl', returnStatus: true) != 0) {
                         sh '''
                             echo "Installing kubectl..."
                             curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
                             chmod +x kubectl
-                            sudo mv kubectl /usr/local/bin/ || mkdir -p $WORKSPACE/bin
+                            mkdir -p $WORKSPACE/bin
                             mv kubectl $WORKSPACE/bin/
-                            export PATH="$WORKSPACE/bin:$PATH"
                         '''
                     }
                     
                     sh '''
-                        echo "Environment verification:"
-                        docker --version
+                        echo "Environment status:"
+                        echo "Docker available: ${DOCKER_AVAILABLE}"
                         kubectl version --client
                     '''
                 }
@@ -78,6 +71,9 @@ pipeline {
         }
         
         stage('Build and Push Image') {
+            when {
+                expression { env.DOCKER_AVAILABLE.toBoolean() }
+            }
             steps {
                 script {
                     withCredentials([usernamePassword(
@@ -105,6 +101,8 @@ pipeline {
         stage('Deploy New Version') {
             steps {
                 script {
+                    // This assumes you have pre-built images in your registry
+                    // or are using some other deployment method
                     sh """
                         echo "Deploying $DEPLOY_VERSION version..."
                         sed "s|{{IMAGE}}|$DOCKER_HUB_REPO:$DEPLOY_VERSION|g" app-deployment.yaml > temp-deploy.yaml
@@ -118,6 +116,7 @@ pipeline {
             }
         }
         
+        // Remaining stages remain the same as previous example...
         stage('Verify Deployment') {
             steps {
                 script {
@@ -173,13 +172,13 @@ pipeline {
         always {
             sh '''
                 echo "Cleaning up workspace..."
-                if command -v docker &> /dev/null; then
+                if [ "${DOCKER_AVAILABLE}" = "true" ]; then
                     docker logout || true
                 fi
             '''
         }
         success {
-            echo "✅ Successfully deployed $DEPLOY_VERSION version"
+            echo "✅ Deployment completed successfully"
         }
         failure {
             script {
