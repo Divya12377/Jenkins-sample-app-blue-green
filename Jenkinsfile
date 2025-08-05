@@ -11,11 +11,15 @@ pipeline {
         stage('Verify Environment') {
             steps {
                 script {
-                    // Try to detect Docker
+                    // Check for Docker
                     env.DOCKER_AVAILABLE = sh(
                         script: 'command -v docker',
                         returnStatus: true
                     ) == 0
+                    
+                    if (!env.DOCKER_AVAILABLE.toBoolean()) {
+                        error("Docker not found on this agent. Please use an agent with Docker installed.")
+                    }
                     
                     // Install kubectl if not available
                     if (sh(script: 'command -v kubectl', returnStatus: true) != 0) {
@@ -29,8 +33,8 @@ pipeline {
                     }
                     
                     sh '''
-                        echo "Environment status:"
-                        echo "Docker available: ${DOCKER_AVAILABLE}"
+                        echo "Environment verification:"
+                        docker --version
                         kubectl version --client
                     '''
                 }
@@ -68,9 +72,6 @@ pipeline {
         }
         
         stage('Build and Push Image') {
-            when {
-                expression { env.DOCKER_AVAILABLE.toBoolean() }
-            }
             steps {
                 script {
                     withCredentials([usernamePassword(
@@ -82,7 +83,7 @@ pipeline {
                             echo "Logging in to Docker Hub..."
                             echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
                             
-                            echo "Building Docker image..."
+                            echo "Building Docker image with curl..."
                             docker build -t $DOCKER_HUB_REPO:$DEPLOY_VERSION ./app
                             
                             echo "Pushing image to registry..."
@@ -100,7 +101,6 @@ pipeline {
                 script {
                     sh """
                         echo "Deploying $DEPLOY_VERSION version..."
-                        # Use pre-built image (assumes you've built it elsewhere)
                         sed "s|{{IMAGE}}|$DOCKER_HUB_REPO:$DEPLOY_VERSION|g" ./app/$DEPLOY_FILE > temp-deploy.yaml
                         kubectl apply -f temp-deploy.yaml -n $KUBE_NAMESPACE
                         kubectl apply -f ./app/app-service.yaml -n $KUBE_NAMESPACE
@@ -117,9 +117,13 @@ pipeline {
             steps {
                 script {
                     sh """
-                        echo "Verifying deployment health..."
-                        POD_NAME=\$(kubectl get pod -n $KUBE_NAMESPACE -l app=sample-app,version=$DEPLOY_VERSION -o jsonpath='{.items[0].metadata.name}')
-                        kubectl exec \$POD_NAME -n $KUBE_NAMESPACE -- curl -s http://localhost:3000/health
+                        echo "Verifying deployment..."
+                        # Method 1: Using kubectl wait (recommended)
+                        kubectl wait --for=condition=available --timeout=300s deployment/sample-app-$DEPLOY_VERSION -n $KUBE_NAMESPACE
+                        
+                        # Method 2: Alternative health check if you modify your app to expose a /health endpoint
+                        # POD_NAME=\$(kubectl get pod -n $KUBE_NAMESPACE -l app=sample-app,version=$DEPLOY_VERSION -o jsonpath='{.items[0].metadata.name}')
+                        # kubectl exec \$POD_NAME -n $KUBE_NAMESPACE -- sh -c 'wget -q -O - http://localhost:3000/health'
                         
                         echo "Verifying service endpoints..."
                         kubectl get endpoints sample-app-service -n $KUBE_NAMESPACE
@@ -134,7 +138,6 @@ pipeline {
                     sh """
                         echo "Switching traffic to $DEPLOY_VERSION..."
                         kubectl patch service sample-app-service -n $KUBE_NAMESPACE -p '{"spec":{"selector":{"version":"$DEPLOY_VERSION"}}}'
-                        
                         echo "Traffic switched successfully"
                         sleep 5
                     """
@@ -147,14 +150,12 @@ pipeline {
         always {
             sh '''
                 echo "Cleaning up..."
-                if [ "${DOCKER_AVAILABLE}" = "true" ]; then
-                    docker logout || true
-                fi
+                docker logout || true
             '''
         }
         failure {
             script {
-                echo "❌ Deployment failed!"
+                echo "❌ Deployment failed! Attempting rollback..."
                 if (env.CURRENT_VERSION && env.CURRENT_VERSION != 'none') {
                     sh """
                         kubectl patch service sample-app-service -n $KUBE_NAMESPACE -p '{"spec":{"selector":{"version":"$CURRENT_VERSION"}}}'
