@@ -1,12 +1,8 @@
-FROM node:18-alpine
-
-WORKDIR /app
-
+FROM node:14
+WORKDIR /usr/src/app
 COPY package*.json ./
 RUN npm install
-
 COPY . .
-
+RUN apt-get update && apt-get install -y curl
 EXPOSE 3000
-
-CMD ["npm", "start"]
+CMD ["node", "server.js"]
